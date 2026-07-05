@@ -815,9 +815,18 @@ fn append_tool_call(
     arguments: Value,
     pending_reasoning: Option<PendingReasoning>,
 ) {
+    // A tool call belongs to the assistant turn that produced it. In the
+    // OpenAI Chat shape one assistant message carries BOTH `content` and
+    // `tool_calls`, so absorb the call into the preceding assistant message
+    // regardless of whether it already has text content. Splitting a
+    // content-bearing assistant turn into a separate text message + a
+    // tool-call message rewrites the history into a shape no OpenAI client
+    // emits, and some backends (e.g. reasoning models that pattern-match their
+    // own transcript) then learn to end a turn with a text preamble instead of
+    // calling the tool. Only start a new assistant message when the previous
+    // message is not an assistant (i.e. a tool result or user turn closed it).
     if let Some(last) = messages.last_mut()
         && last.role == "assistant"
-        && (last.tool_calls.is_some() || last.content.is_none())
     {
         let index = last.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0);
         let tool_call = ChatToolCall {
@@ -1719,7 +1728,10 @@ mod tests {
     }
 
     #[test]
-    fn test_append_tool_call_no_merge_into_content_message() {
+    fn test_append_tool_call_merges_into_content_message() {
+        // A content-bearing assistant message must absorb the following tool
+        // call into the SAME message (`content` + `tool_calls`), the canonical
+        // OpenAI Chat shape — not split into two adjacent assistant messages.
         let mut messages = vec![ChatMessage {
             role: "assistant".to_string(),
             content: Some(Value::String("some text".to_string())),
@@ -1736,14 +1748,68 @@ mod tests {
             json!({}),
             None,
         );
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].content,
-            Some(Value::String("some text".to_string()))
+            Some(Value::String("some text".to_string())),
+            "text content must be preserved on the merged message"
         );
-        assert!(messages[0].tool_calls.is_none());
-        assert!(messages[1].tool_calls.is_some());
-        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].index, Some(0));
+        let calls = messages[0].tool_calls.as_ref().expect("tool call merged");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].index, Some(0));
+        assert_eq!(calls[0].function.name.as_deref(), Some("fn_1"));
+    }
+
+    #[test]
+    fn lowering_keeps_assistant_text_and_tool_call_in_one_message() {
+        // End-to-end: an assistant turn that emitted BOTH text and a tool call
+        // (as separate canonical items) must lower to a SINGLE upstream chat
+        // assistant message carrying `content` + `tool_calls` — the OpenAI Chat
+        // shape a real client emits — not two adjacent assistant messages.
+        let mut req = base_test_request();
+        req.input = vec![
+            user_msg("look at the repo"),
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Let me explore the key directories.".to_string(),
+                }],
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "read".to_string(),
+                namespace: None,
+                arguments: "{\"path\":\"src\"}".to_string(),
+                call_id: "call_1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: Value::String("file list".to_string()),
+            },
+            user_msg("continue"),
+        ];
+
+        let lowered = lower_request(&req, vec![]).expect("lower_request");
+        let roles: Vec<&str> = lowered.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+
+        let assistant = &lowered.messages[1];
+        assert_eq!(
+            assistant.content,
+            Some(Value::String(
+                "Let me explore the key directories.".to_string()
+            )),
+            "assistant text must be preserved on the same message as the tool call"
+        );
+        let calls = assistant
+            .tool_calls
+            .as_ref()
+            .expect("assistant message carries the tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name.as_deref(), Some("read"));
+        assert_eq!(lowered.messages[2].tool_call_id.as_deref(), Some("call_1"));
     }
 
     // --- M2 test ---
