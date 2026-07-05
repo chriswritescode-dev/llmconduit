@@ -157,6 +157,11 @@ pub fn lower_request_with_image_agent_and_roles(
     }
     let tools = lower_tools(&request.tools)?;
     let registry = build_tool_registry(&request.tools, image_agent_active)?;
+    // Role rules apply only to the tail past the baseline (`split_off` below),
+    // so with an active roles policy a tool call must not merge into the
+    // replayed baseline's trailing assistant message — it would escape rule
+    // processing. Without roles the merge may cross the boundary freely.
+    let tool_call_merge_floor = if roles.is_some() { baseline_len } else { 0 };
     let mut pending_reasoning: Option<PendingReasoning> = None;
     for item in &request.input {
         match item {
@@ -213,6 +218,7 @@ pub fn lower_request_with_image_agent_and_roles(
                 name.clone(),
                 parse_json_string(arguments)?,
                 pending_reasoning.take(),
+                tool_call_merge_floor,
             ),
             ResponseItem::CustomToolCall {
                 call_id,
@@ -225,6 +231,7 @@ pub fn lower_request_with_image_agent_and_roles(
                 name.clone(),
                 json!({ "input": input }),
                 pending_reasoning.take(),
+                tool_call_merge_floor,
             ),
             ResponseItem::ToolSearchCall {
                 call_id,
@@ -245,6 +252,7 @@ pub fn lower_request_with_image_agent_and_roles(
                     "tool_search".to_string(),
                     arguments.clone(),
                     pending_reasoning.take(),
+                    tool_call_merge_floor,
                 );
             }
             ResponseItem::LocalShellCall {
@@ -270,6 +278,7 @@ pub fn lower_request_with_image_agent_and_roles(
                     "local_shell".to_string(),
                     arguments,
                     pending_reasoning.take(),
+                    tool_call_merge_floor,
                 );
             }
             ResponseItem::FunctionCallOutput { call_id, output }
@@ -319,6 +328,7 @@ pub fn lower_request_with_image_agent_and_roles(
                     "web_search".to_string(),
                     web_search_arguments(action),
                     pending_reasoning.take(),
+                    tool_call_merge_floor,
                 );
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
@@ -483,8 +493,11 @@ fn merge_adjacent_role_runs(messages: &mut Vec<ChatMessage>, roles: &[String]) {
             continue;
         }
         let mut parts = Vec::new();
+        let mut tool_calls: Vec<ChatToolCall> = Vec::new();
+        let mut reasoning: Option<PendingReasoning> = None;
         while index < messages.len() && messages[index].role == role {
-            if let Some(content) = &messages[index].content {
+            let message = &messages[index];
+            if let Some(content) = &message.content {
                 let text = match content {
                     Value::String(text) => text.clone(),
                     other => other.to_string(),
@@ -493,17 +506,48 @@ fn merge_adjacent_role_runs(messages: &mut Vec<ChatMessage>, roles: &[String]) {
                     parts.push(text);
                 }
             }
+            // Collapsing a run must not lose the run's tool calls or
+            // reasoning: fold them onto the merged message instead of
+            // rebuilding it content-only.
+            if let Some(calls) = &message.tool_calls {
+                tool_calls.extend(calls.iter().cloned());
+            }
+            if message.reasoning_content.is_some() || message.thinking.is_some() {
+                let text = message.reasoning_content.clone().unwrap_or_default();
+                let signature = message
+                    .thinking
+                    .as_ref()
+                    .and_then(|thinking| thinking.signature.clone());
+                match reasoning.as_mut() {
+                    Some(existing) => existing.append(text, signature),
+                    None => reasoning = Some(PendingReasoning::from_parts(text, signature)),
+                }
+            }
             index += 1;
         }
-        if !parts.is_empty() {
+        if !parts.is_empty() || !tool_calls.is_empty() || reasoning.is_some() {
+            let (reasoning_content, thinking) = reasoning
+                .map(PendingReasoning::into_chat_parts)
+                .unwrap_or((None, None));
+            for (position, call) in tool_calls.iter_mut().enumerate() {
+                call.index = Some(position);
+            }
             out.push(ChatMessage {
                 role,
-                content: Some(Value::String(parts.join("\n\n"))),
+                content: if parts.is_empty() {
+                    None
+                } else {
+                    Some(Value::String(parts.join("\n\n")))
+                },
                 tool_call_id: None,
                 name: None,
-                reasoning_content: None,
-                thinking: None,
-                tool_calls: None,
+                reasoning_content,
+                thinking,
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
             });
         }
     }
@@ -814,6 +858,7 @@ fn append_tool_call(
     name: String,
     arguments: Value,
     pending_reasoning: Option<PendingReasoning>,
+    merge_floor: usize,
 ) {
     // A tool call belongs to the assistant turn that produced it. In the
     // OpenAI Chat shape one assistant message carries BOTH `content` and
@@ -824,57 +869,63 @@ fn append_tool_call(
     // emits, and some backends (e.g. reasoning models that pattern-match their
     // own transcript) then learn to end a turn with a text preamble instead of
     // calling the tool. Only start a new assistant message when the previous
-    // message is not an assistant (i.e. a tool result or user turn closed it).
-    if let Some(last) = messages.last_mut()
-        && last.role == "assistant"
-    {
-        let index = last.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0);
-        let tool_call = ChatToolCall {
-            id: Some(call_id),
-            index: Some(index),
-            kind: "function".to_string(),
-            function: ChatFunctionCall {
-                name: Some(name),
-                arguments: Some(arguments),
-            },
-        };
-        if let Some(existing) = &mut last.tool_calls {
-            existing.push(tool_call);
-        } else {
-            last.tool_calls = Some(vec![tool_call]);
-        }
-        if let Some(reasoning) = pending_reasoning
-            && last.reasoning_content.is_none()
-        {
-            let (reasoning_content, thinking) = reasoning.into_chat_parts();
-            last.reasoning_content = reasoning_content;
-            last.thinking = thinking;
-        }
-        return;
-    }
+    // message is not an assistant (i.e. a tool result or user turn closed it),
+    // or when merging would reach below `merge_floor`: role rules run only on
+    // the tail past the replayed baseline, so a caller with an active roles
+    // policy sets the floor to the baseline length to keep the tool call
+    // inside the rule-processed tail.
+    let mergeable = messages.len() > merge_floor
+        && messages.last().is_some_and(|last| last.role == "assistant");
+    let index = if mergeable {
+        messages
+            .last()
+            .and_then(|last| last.tool_calls.as_ref())
+            .map(|calls| calls.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let tool_call = ChatToolCall {
         id: Some(call_id),
-        index: Some(0),
+        index: Some(index),
         kind: "function".to_string(),
         function: ChatFunctionCall {
             name: Some(name),
             arguments: Some(arguments),
         },
     };
+    if mergeable && let Some(last) = messages.last_mut() {
+        if let Some(existing) = &mut last.tool_calls {
+            existing.push(tool_call);
+        } else {
+            last.tool_calls = Some(vec![tool_call]);
+        }
+        if let Some(reasoning) = pending_reasoning {
+            // Interleaved thinking (Reasoning -> Message -> Reasoning ->
+            // FunctionCall) leaves reasoning already on the merge target; fold
+            // the new block in with the same join semantics as consecutive
+            // Reasoning items instead of dropping it.
+            let mut merged = PendingReasoning::from_parts(
+                last.reasoning_content.take().unwrap_or_default(),
+                last.thinking.take().and_then(|thinking| thinking.signature),
+            );
+            merged.append(reasoning.text, reasoning.signature);
+            let (reasoning_content, thinking) = merged.into_chat_parts();
+            last.reasoning_content = reasoning_content;
+            last.thinking = thinking;
+        }
+        return;
+    }
+    let (reasoning_content, thinking) = pending_reasoning
+        .map(PendingReasoning::into_chat_parts)
+        .unwrap_or((None, None));
     messages.push(ChatMessage {
         role: "assistant".to_string(),
         content: None,
         tool_call_id: None,
         name: None,
-        reasoning_content: pending_reasoning
-            .as_ref()
-            .map(|reasoning| reasoning.text.clone()),
-        thinking: pending_reasoning.and_then(|reasoning| {
-            reasoning.signature.map(|signature| ChatThinking {
-                content: reasoning.text,
-                signature: Some(signature),
-            })
-        }),
+        reasoning_content,
+        thinking,
         tool_calls: Some(vec![tool_call]),
     });
 }
@@ -1705,7 +1756,7 @@ mod tests {
         assert!(validate_request(&req).is_err());
     }
 
-    // --- M1+M4 tests ---
+    // --- append_tool_call merge tests ---
 
     #[test]
     fn test_append_tool_call_sequential_indices() {
@@ -1717,6 +1768,7 @@ mod tests {
                 format!("fn_{i}"),
                 json!({}),
                 None,
+                0,
             );
         }
         assert_eq!(messages.len(), 1);
@@ -1747,6 +1799,7 @@ mod tests {
             "fn_1".to_string(),
             json!({}),
             None,
+            0,
         );
         assert_eq!(messages.len(), 1);
         assert_eq!(
@@ -1810,6 +1863,179 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name.as_deref(), Some("read"));
         assert_eq!(lowered.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn interleaved_reasoning_survives_tool_call_merge() {
+        // Anthropic interleaved-thinking shape: Reasoning -> Message ->
+        // Reasoning -> FunctionCall. The text Message consumes the first
+        // reasoning block, so the merge target already carries
+        // `reasoning_content` when the second block arrives with the tool
+        // call. The second block (and its signature) must be folded in with
+        // the same `\n\n` join as consecutive Reasoning items — not dropped.
+        let mut req = base_test_request();
+        req.input = vec![
+            user_msg("look at the repo"),
+            ResponseItem::Reasoning {
+                id: "rs_1".to_string(),
+                summary: vec![ReasoningSummaryItem::SummaryText {
+                    text: "first block".to_string(),
+                }],
+                content: None,
+                encrypted_content: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Let me explore.".to_string(),
+                }],
+                phase: None,
+            },
+            ResponseItem::Reasoning {
+                id: "rs_2".to_string(),
+                summary: vec![ReasoningSummaryItem::SummaryText {
+                    text: "second block".to_string(),
+                }],
+                content: None,
+                encrypted_content: Some("sig_2".to_string()),
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "read".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "call_1".to_string(),
+            },
+        ];
+
+        let lowered = lower_request(&req, vec![]).expect("lower_request");
+        let roles: Vec<&str> = lowered.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
+
+        let assistant = &lowered.messages[1];
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("first block\n\nsecond block"),
+            "second reasoning block must be appended, not dropped"
+        );
+        let thinking = assistant
+            .thinking
+            .as_ref()
+            .expect("signature from the second block must survive the merge");
+        assert_eq!(thinking.signature.as_deref(), Some("sig_2"));
+        assert!(assistant.tool_calls.is_some());
+    }
+
+    #[test]
+    fn roles_policy_keeps_tool_call_out_of_replay_baseline() {
+        // Role rules run only on the tail past the replayed baseline. With an
+        // active roles policy a tool call that follows a baseline-terminal
+        // assistant message must start a NEW tail message (rule-processed),
+        // not merge below the baseline boundary where rules never look.
+        let roles: RolesConfig = serde_json::from_value(json!({
+            "user": {},
+            "assistant": {},
+            "tool": {},
+            "*": {"action": "reject"}
+        }))
+        .expect("roles config");
+        let baseline = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(Value::String("already served text".to_string())),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        }];
+        let mut request = base_test_request();
+        request.input = vec![ResponseItem::FunctionCall {
+            id: None,
+            name: "read".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call_1".to_string(),
+        }];
+
+        let lowered = lower_request_with_image_agent_and_roles(
+            &request,
+            baseline.clone(),
+            false,
+            Some(&roles),
+        )
+        .expect("lower request");
+        assert_eq!(lowered.messages.len(), 2);
+        assert!(
+            lowered.messages[0].tool_calls.is_none(),
+            "replay baseline message must stay untouched"
+        );
+        assert_eq!(lowered.messages[1].role, "assistant");
+        assert!(
+            lowered.messages[1].tool_calls.is_some(),
+            "tool call must land in the rule-processed tail"
+        );
+
+        // Without a roles policy there is no tail scoping: the canonical
+        // merged shape crosses the baseline boundary freely.
+        let lowered = lower_request_with_image_agent_and_roles(&request, baseline, false, None)
+            .expect("lower request");
+        assert_eq!(lowered.messages.len(), 1);
+        assert!(lowered.messages[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn merge_adjacent_role_runs_carries_tool_calls_and_reasoning() {
+        // Collapsing an adjacent same-role run must not lose the run's tool
+        // calls, reasoning, or thinking signature — the merged message carries
+        // them, re-indexed, instead of being rebuilt content-only.
+        let mut messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(Value::String("part one".to_string())),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                thinking: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: Some("thinking".to_string()),
+                thinking: Some(ChatThinking {
+                    content: "thinking".to_string(),
+                    signature: Some("sig_1".to_string()),
+                }),
+                tool_calls: Some(vec![ChatToolCall {
+                    id: Some("call_1".to_string()),
+                    index: Some(0),
+                    kind: "function".to_string(),
+                    function: ChatFunctionCall {
+                        name: Some("read".to_string()),
+                        arguments: Some(json!({})),
+                    },
+                }]),
+            },
+        ];
+        merge_adjacent_role_runs(&mut messages, &["assistant".to_string()]);
+        assert_eq!(messages.len(), 1);
+        let merged = &messages[0];
+        assert_eq!(merged.content, Some(Value::String("part one".to_string())));
+        assert_eq!(merged.reasoning_content.as_deref(), Some("thinking"));
+        assert_eq!(
+            merged
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.signature.as_deref()),
+            Some("sig_1")
+        );
+        let calls = merged.tool_calls.as_ref().expect("tool calls carried");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name.as_deref(), Some("read"));
+        assert_eq!(calls[0].index, Some(0));
     }
 
     // --- M2 test ---
