@@ -1867,12 +1867,15 @@ mod tests {
 
     #[test]
     fn interleaved_reasoning_survives_tool_call_merge() {
-        // Anthropic interleaved-thinking shape: Reasoning -> Message ->
-        // Reasoning -> FunctionCall. The text Message consumes the first
-        // reasoning block, so the merge target already carries
-        // `reasoning_content` when the second block arrives with the tool
-        // call. The second block (and its signature) must be folded in with
-        // the same `\n\n` join as consecutive Reasoning items — not dropped.
+        // Interleaved reasoning: Reasoning -> Message -> Reasoning ->
+        // FunctionCall. Any ingress can produce this ordering (raw Responses
+        // reasoning items, chat `reasoning_content`, Anthropic `thinking`
+        // blocks) — a model that thinks, emits text, thinks again, then calls
+        // a tool. The text Message consumes the first reasoning block, so the
+        // merge target already carries `reasoning_content` when the second
+        // block arrives with the tool call. The second block (and its
+        // signature) must be folded in with the same `\n\n` join as
+        // consecutive Reasoning items — not dropped.
         let mut req = base_test_request();
         req.input = vec![
             user_msg("look at the repo"),
