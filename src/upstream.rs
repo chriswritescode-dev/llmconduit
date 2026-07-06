@@ -371,8 +371,6 @@ pub struct UpstreamModelEntry {
     pub context_limit: Option<i64>,
 }
 
-const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
-
 /// One pre-first-chunk serving backend: its FINAL model id (after any
 /// routing/route/exposed-alias + per-provider `upstream_model` rewrite — no
 /// further remap) and the context-window length the upstream reports for it,
@@ -709,6 +707,7 @@ pub struct RoutingUpstreamClient {
     /// `providers` so routes never enter the `/v1/models` union.
     route_providers: Vec<RouteUpstreamProvider>,
     routes: Vec<ModelRouteSpec>,
+    model_catalog_ttl_secs: u64,
     catalog: Arc<AsyncMutex<Option<CachedRoutingModelCatalog>>>,
     /// D4 catalog metadata `(fetched_ms, size)` published for the topology map.
     /// Swapped as a SINGLE immutable `Arc<CatalogMeta>` inside `refresh_catalog`
@@ -2379,10 +2378,20 @@ impl RoutingUpstreamClient {
         route_providers: Vec<RouteUpstreamProvider>,
         routes: Vec<ModelRouteSpec>,
     ) -> Self {
+        Self::with_routes_and_catalog_ttl(providers, route_providers, routes, 300)
+    }
+
+    pub fn with_routes_and_catalog_ttl(
+        providers: Vec<RoutingUpstreamProvider>,
+        route_providers: Vec<RouteUpstreamProvider>,
+        routes: Vec<ModelRouteSpec>,
+        model_catalog_ttl_secs: u64,
+    ) -> Self {
         Self {
             providers,
             route_providers,
             routes,
+            model_catalog_ttl_secs,
             catalog: Arc::new(AsyncMutex::new(None)),
             catalog_meta: Arc::new(Mutex::new(Arc::new(CatalogMeta::default()))),
         }
@@ -2429,7 +2438,7 @@ impl RoutingUpstreamClient {
     async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
         let mut cache = self.catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed().as_secs() < self.model_catalog_ttl_secs
         {
             return Ok(cached.catalog.clone());
         }

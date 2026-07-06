@@ -190,6 +190,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         brave_max_results,
         request_timeout_secs,
         connect_timeout_secs: existing.connect_timeout_secs,
+        model_catalog_ttl_secs: existing.model_catalog_ttl_secs,
         max_web_search_rounds: existing.max_web_search_rounds,
         flatten_content: existing.flatten_content,
         max_replay_entries: existing.max_replay_entries,

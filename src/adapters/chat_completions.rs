@@ -11,6 +11,7 @@ use crate::models::responses::ReasoningContentItem;
 use crate::models::responses::ReasoningRequest;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::TerminalReason;
 use crate::models::responses::TextControls;
 use crate::models::responses::TextFormat;
 use crate::models::responses::ToolSpec;
@@ -378,6 +379,17 @@ pub struct ChatCompletionStreamConverter {
     /// NOT request it, and must not leak server-side internals (G2, Finding 2).
     /// Normal Chat reasoning (client asked, or non-forced) is unaffected.
     suppress_reasoning: bool,
+    /// Suppressed reasoning buffered for terminal promotion (G8 for Chat): a
+    /// backend that puts the ANSWER in the reasoning channel would otherwise
+    /// yield a visibly empty turn for a suppressed client. Buffered only while
+    /// no real content has started; cleared at a web-search boundary
+    /// (pre-search reasoning is a genuine CoT preface, never the answer).
+    suppressed_reasoning: String,
+    /// Whether any visible `content` delta was emitted. Gates promotion (a
+    /// turn with real text keeps its reasoning suppressed as usual).
+    content_started: bool,
+    /// A reasoning signature marks genuine chain-of-thought — never promoted.
+    reasoning_signed: bool,
 }
 
 impl ChatCompletionStreamConverter {
@@ -399,6 +411,9 @@ impl ChatCompletionStreamConverter {
             emitted_tool_calls: HashMap::new(),
             pending_tool_arguments: HashMap::new(),
             suppress_reasoning,
+            suppressed_reasoning: String::new(),
+            content_started: false,
+            reasoning_signed: false,
         }
     }
 
@@ -416,6 +431,10 @@ impl ChatCompletionStreamConverter {
             }
             "response.output_text.delta" => {
                 if let Some(delta) = event.data.get("delta").and_then(Value::as_str) {
+                    self.content_started = true;
+                    // Real text arrived: earlier reasoning was a genuine CoT
+                    // preface, so it stays suppressed (never promoted).
+                    self.suppressed_reasoning.clear();
                     self.ensure_role_chunk(&mut output);
                     output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
                         index: 0,
@@ -431,6 +450,16 @@ impl ChatCompletionStreamConverter {
                 // Suppress forced-but-unrequested reasoning so it does not leak
                 // to a Chat client (G2, Finding 2). Normal reasoning still flows.
                 if self.suppress_reasoning {
+                    // Buffer instead of discarding (G8 for Chat): if the turn
+                    // ends with NO visible output on a clean stop, the backend
+                    // put the answer here and the terminal handler promotes it
+                    // to `content`. Late reasoning (after text began) stays
+                    // dropped, mirroring the Anthropic converter.
+                    if !self.content_started
+                        && let Some(delta) = event.data.get("delta").and_then(Value::as_str)
+                    {
+                        self.suppressed_reasoning.push_str(delta);
+                    }
                     return output;
                 }
                 if let Some(delta) = event.data.get("delta").and_then(Value::as_str) {
@@ -466,8 +495,20 @@ impl ChatCompletionStreamConverter {
                     self.emit_tool_call(tool_call, &mut output);
                 }
             }
+            "response.reasoning_summary_text.signature_delta" => {
+                // A signature marks genuine chain-of-thought: pin the buffer to
+                // suppression (never promoted to visible content).
+                self.reasoning_signed = true;
+            }
+            "response.web_search_results" => {
+                // A server-side web-search boundary: reasoning buffered so far
+                // was the pre-search CoT preface, not the answer. Drop it so
+                // only a post-search reasoning-only continuation can promote.
+                self.suppressed_reasoning.clear();
+            }
             "response.completed" | "response.incomplete" => {
                 self.ensure_role_chunk(&mut output);
+                self.promote_suppressed_reasoning(event, &mut output);
                 let finish_reason = finish_reason_from_response(&event.data, self.has_tool_calls());
                 output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
                     index: 0,
@@ -496,6 +537,38 @@ impl ChatCompletionStreamConverter {
             _ => {}
         }
         output
+    }
+
+    /// G8 promotion for Chat (mirrors the Anthropic converter's terminal
+    /// matrix): when suppressed reasoning was the ONLY output this turn, the
+    /// backend put the answer in the reasoning channel — promote it to a
+    /// visible `content` delta, but ONLY on a CLEAN STOP (typed
+    /// `terminal_reason: stop`, falling back to a literal `response.completed`
+    /// when untagged), with no content started, no tool calls, and no
+    /// signature. Every other shape keeps the buffer suppressed.
+    fn promote_suppressed_reasoning(&mut self, event: &SseEvent, output: &mut Vec<ChatSseEvent>) {
+        if self.suppressed_reasoning.is_empty() {
+            return;
+        }
+        let promoted = std::mem::take(&mut self.suppressed_reasoning);
+        let clean_stop = event
+            .data
+            .get("response")
+            .and_then(TerminalReason::from_resource_value)
+            .map(TerminalReason::is_clean_stop)
+            .unwrap_or(event.event == "response.completed");
+        if !clean_stop || self.content_started || self.has_tool_calls() || self.reasoning_signed {
+            return;
+        }
+        self.content_started = true;
+        output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
+            index: 0,
+            delta: ChatStreamDelta {
+                content: Some(promoted),
+                ..Default::default()
+            },
+            finish_reason: None,
+        }])));
     }
 
     fn ensure_role_chunk(&mut self, output: &mut Vec<ChatSseEvent>) {
@@ -630,8 +703,19 @@ fn chat_completion_response_from_response(
     response: &Value,
     suppress_reasoning: bool,
 ) -> Value {
-    let (content, mut reasoning_content, tool_calls) = message_from_response_output(response);
+    let (mut content, mut reasoning_content, tool_calls) = message_from_response_output(response);
     if suppress_reasoning {
+        // G8 promotion for Chat (see `promote_suppressed_reasoning`): a
+        // reasoning-only clean stop means the backend put the answer in the
+        // reasoning channel — surface it as `content` instead of returning a
+        // visibly empty message. Everything else stays suppressed.
+        if content.is_empty()
+            && tool_calls.is_empty()
+            && response_is_clean_stop(response)
+            && let Some(promoted) = promotable_reasoning_text(response)
+        {
+            content = promoted;
+        }
         reasoning_content.clear();
     }
     let has_tool_calls = !tool_calls.is_empty();
@@ -701,6 +785,45 @@ fn message_from_response_output(response: &Value) -> (String, String, Vec<ChatTo
         tool_call.index = Some(index);
     }
     (content, reasoning, tool_calls)
+}
+
+/// Clean-stop gate for the non-streaming promotion: the typed
+/// `terminal_reason` when the engine tagged the resource, else fall back to a
+/// `completed` status (mirrors the streaming converters' T7 fallback).
+fn response_is_clean_stop(response: &Value) -> bool {
+    TerminalReason::from_resource_value(response)
+        .map(TerminalReason::is_clean_stop)
+        .unwrap_or(response.get("status").and_then(Value::as_str) == Some("completed"))
+}
+
+/// The trailing run of unsigned reasoning items — the only promotable shape.
+/// Any `message` item means real content started (never promote); a tool or
+/// web-search item resets the run (pre-boundary reasoning is a CoT preface,
+/// not the answer); a signature (`encrypted_content`) pins genuine
+/// chain-of-thought to suppression.
+fn promotable_reasoning_text(response: &Value) -> Option<String> {
+    let output = response.get("output").and_then(Value::as_array)?;
+    let mut trailing: Vec<&Value> = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => trailing.push(item),
+            Some("message") => return None,
+            _ => trailing.clear(),
+        }
+    }
+    if trailing.iter().any(|item| {
+        item.get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some()
+    }) {
+        return None;
+    }
+    let text = trailing
+        .iter()
+        .map(|item| reasoning_item_text(item))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn message_item_text(item: &Value) -> String {
@@ -1143,5 +1266,155 @@ mod tests {
     #[test]
     fn collected_keeps_reasoning_when_not_suppressed() {
         assert_eq!(collected_reasoning(false), Some("hidden".to_string()));
+    }
+
+    // --- G8 for Chat: reasoning-only clean stop promotes to visible content ---
+
+    fn completed_event(terminal_reason: &str) -> SseEvent {
+        SseEvent {
+            event: if terminal_reason == "length" {
+                "response.incomplete".to_string()
+            } else {
+                "response.completed".to_string()
+            },
+            data: json!({
+                "response": {
+                    "id": "resp_1",
+                    "status": if terminal_reason == "length" { "incomplete" } else { "completed" },
+                    "terminal_reason": terminal_reason,
+                    "output": []
+                }
+            }),
+        }
+    }
+
+    /// Run a SUPPRESSED converter over `events` + the terminal event; collect
+    /// the streamed visible `content` deltas.
+    fn streamed_content_suppressed(events: Vec<SseEvent>, terminal_reason: &str) -> Vec<String> {
+        let mut converter = ChatCompletionStreamConverter::with_reasoning_suppression(
+            "kimi-k2".to_string(),
+            false,
+            true,
+        );
+        let mut out = Vec::new();
+        for event in events.into_iter().chain([completed_event(terminal_reason)]) {
+            for chat_event in converter.convert(&event) {
+                if let ChatSseEvent::Data(value) = chat_event
+                    && let Some(content) = value["choices"][0]["delta"]["content"].as_str()
+                {
+                    out.push(content.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// A suppressed reasoning-only turn on a clean stop is the backend putting
+    /// the ANSWER in the reasoning channel: promote it to visible content
+    /// instead of serving a visibly empty message.
+    #[test]
+    fn stream_promotes_suppressed_reasoning_only_on_clean_stop() {
+        assert_eq!(
+            streamed_content_suppressed(vec![reasoning_delta_event()], "stop"),
+            vec!["secret chain of thought"]
+        );
+    }
+
+    /// A non-clean terminal (`length`) never promotes.
+    #[test]
+    fn stream_does_not_promote_on_incomplete() {
+        assert!(streamed_content_suppressed(vec![reasoning_delta_event()], "length").is_empty());
+    }
+
+    /// Once real text streamed, the reasoning was a CoT preface: stays
+    /// suppressed, and the visible content is only the real answer.
+    #[test]
+    fn stream_does_not_promote_after_content_started() {
+        assert_eq!(
+            streamed_content_suppressed(vec![reasoning_delta_event(), text_delta_event()], "stop"),
+            vec!["visible answer"]
+        );
+    }
+
+    /// Signed reasoning is genuine chain-of-thought — never promoted.
+    #[test]
+    fn stream_does_not_promote_signed_reasoning() {
+        let signature = SseEvent {
+            event: "response.reasoning_summary_text.signature_delta".to_string(),
+            data: json!({ "signature": "sig_123" }),
+        };
+        assert!(
+            streamed_content_suppressed(vec![reasoning_delta_event(), signature], "stop")
+                .is_empty()
+        );
+    }
+
+    /// A server-side web-search boundary drops the pre-search CoT preface;
+    /// only the post-search reasoning-only continuation promotes.
+    #[test]
+    fn stream_web_search_boundary_keeps_only_post_search_reasoning() {
+        let post_search = SseEvent {
+            event: "response.reasoning_text.delta".to_string(),
+            data: json!({ "delta": "the searched answer" }),
+        };
+        let boundary = SseEvent {
+            event: "response.web_search_results".to_string(),
+            data: json!({ "tool_use_id": "ws_1", "query": "q", "results": [] }),
+        };
+        assert_eq!(
+            streamed_content_suppressed(
+                vec![reasoning_delta_event(), boundary, post_search],
+                "stop"
+            ),
+            vec!["the searched answer"]
+        );
+    }
+
+    fn collected_content_suppressed(output: Value, terminal_reason: &str) -> Option<String> {
+        let mut collector =
+            ChatCompletionCollector::with_reasoning_suppression("kimi-k2".to_string(), true);
+        collector.process(&SseEvent {
+            event: "response.completed".to_string(),
+            data: json!({
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "terminal_reason": terminal_reason,
+                    "output": output
+                }
+            }),
+        });
+        let value = collector.into_response().expect("response");
+        value["choices"][0]["message"]["content"]
+            .as_str()
+            .map(ToString::to_string)
+    }
+
+    /// Non-streaming mirror of the streaming promotion.
+    #[test]
+    fn collected_promotes_reasoning_only_on_clean_stop() {
+        let output = json!([
+            { "type": "reasoning", "content": [{ "type": "reasoning_text", "text": "the answer" }] }
+        ]);
+        assert_eq!(
+            collected_content_suppressed(output, "stop"),
+            Some("the answer".to_string())
+        );
+    }
+
+    /// Signed (`encrypted_content`) reasoning never promotes non-streaming.
+    #[test]
+    fn collected_does_not_promote_signed_reasoning() {
+        let output = json!([
+            {
+                "type": "reasoning",
+                "encrypted_content": "sig_123",
+                "content": [{ "type": "reasoning_text", "text": "genuine cot" }]
+            }
+        ]);
+        assert_eq!(
+            collected_content_suppressed(output, "stop"),
+            Some(String::new())
+        );
     }
 }

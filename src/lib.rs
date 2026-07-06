@@ -221,10 +221,11 @@ pub fn build_app_with_gateway_and_options(
                 route.upstream_model.clone(),
             ));
         }
-        Arc::new(RoutingUpstreamClient::with_routes(
+        Arc::new(RoutingUpstreamClient::with_routes_and_catalog_ttl(
             providers,
             route_providers,
             route_specs,
+            config.model_catalog_ttl_secs,
         ))
     } else {
         let primary_upstream = make_upstream_client(

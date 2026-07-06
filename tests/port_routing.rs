@@ -16,9 +16,10 @@
 //! injected kwargs. Output-side nested-`thinking` reshape is already handled in
 //! `chat_to_responses.rs`; this composes with it rather than duplicating it.
 //!
-//! Finding 2: forced-but-unrequested Kimi reasoning must not leak to a Chat
-//! client — the Chat output converter suppresses it when the client did not ask
-//! (no `reasoning_effort`), while leaving normal Chat reasoning unchanged.
+//! Finding 2 update: Chat reasoning suppression is explicit opt-out. If a Chat
+//! request omits thinking parameters, the model/server default is forwarded;
+//! if it explicitly disables thinking, the Chat output converter suppresses
+//! `reasoning_content` while preserving visible answer content.
 //!
 //! These tests drive the full gateway with `MockUpstream` and inspect the
 //! serialized upstream request body, so the effective wire value is asserted
@@ -399,18 +400,34 @@ async fn run_chat_path(request: ChatCompletionRequest) -> (serde_json::Value, Ve
     (body, reasoning)
 }
 
-/// A Chat client that did NOT request reasoning, against a Kimi backend:
-/// thinking is forced ON upstream, but the Chat response surfaces NO
-/// reasoning_content (no server-side leak).
+/// A Chat client that omits thinking parameters, against a Kimi backend:
+/// thinking is enabled upstream by model-family defaults and the Chat response
+/// surfaces that model-default reasoning_content.
 #[tokio::test]
-async fn chat_kimi_forced_reasoning_is_suppressed_when_client_did_not_request() {
+async fn chat_kimi_default_reasoning_surfaces_when_client_omits_thinking_param() {
     let (body, reasoning) = run_chat_path(chat_request("kimi-k2-instruct", None)).await;
-    // Forced upstream...
     assert_eq!(body["chat_template_kwargs"]["thinking"], json!(true));
-    // ...but NOT surfaced to the Chat client.
+    assert_eq!(
+        reasoning,
+        vec!["secret thinking"],
+        "model-default reasoning should surface when the client omitted thinking params"
+    );
+}
+
+/// A Chat client that explicitly disables thinking suppresses any backend
+/// reasoning_content, even if the family defaults would otherwise enable it.
+#[tokio::test]
+async fn chat_reasoning_is_suppressed_when_client_explicitly_disables_thinking() {
+    let mut request = chat_request("kimi-k2-instruct", None);
+    request.extra_body.insert(
+        "chat_template_kwargs".to_string(),
+        json!({ "thinking": false }),
+    );
+    let (body, reasoning) = run_chat_path(request).await;
+    assert_eq!(body["chat_template_kwargs"]["thinking"], json!(false));
     assert!(
         reasoning.is_empty(),
-        "forced unrequested reasoning leaked to Chat: {reasoning:?}"
+        "explicitly disabled reasoning must not surface to Chat: {reasoning:?}"
     );
 }
 
@@ -428,15 +445,16 @@ async fn chat_kimi_reasoning_surfaces_when_client_requested() {
     );
 }
 
-/// A NON-family (non-Kimi/non-DeepSeek) backend: a Chat client that did NOT
-/// request reasoning sees NO reasoning_content. Suppression is family-
-/// independent — it fires off the inbound request alone, not the backend family.
+/// A NON-family (non-Kimi/non-DeepSeek) backend: if the model emits
+/// reasoning_content by default, a Chat client that omitted thinking params
+/// receives it unchanged.
 #[tokio::test]
-async fn chat_non_family_unrequested_reasoning_is_suppressed() {
+async fn chat_non_family_default_reasoning_surfaces_when_client_omits_thinking_param() {
     let (_body, reasoning) = run_chat_path(chat_request("glm-5.1", None)).await;
-    assert!(
-        reasoning.is_empty(),
-        "unrequested reasoning must be suppressed for non-family backends too: {reasoning:?}"
+    assert_eq!(
+        reasoning,
+        vec!["secret thinking"],
+        "model-default reasoning should surface for non-family backends too"
     );
 }
 

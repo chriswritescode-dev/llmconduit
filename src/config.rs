@@ -572,6 +572,9 @@ pub struct Config {
     pub brave_max_results: usize,
     pub request_timeout: Duration,
     pub connect_timeout_secs: u64,
+    /// TTL for upstream `/v1/models` catalog caches. `0` disables caching and
+    /// refreshes on every lookup; default is 300 seconds.
+    pub model_catalog_ttl_secs: u64,
     pub max_web_search_rounds: usize,
     pub flatten_content: bool,
     pub max_replay_entries: usize,
@@ -1196,6 +1199,10 @@ pub struct PersistedConfig {
     pub request_timeout_secs: u64,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// TTL for upstream `/v1/models` catalog caches. Set to `0` to refresh on
+    /// every lookup. Defaults to 300 seconds.
+    #[serde(default = "default_model_catalog_ttl_secs")]
+    pub model_catalog_ttl_secs: u64,
     #[serde(default = "default_max_web_search_rounds")]
     pub max_web_search_rounds: usize,
     #[serde(default = "default_flatten_content")]
@@ -1268,6 +1275,10 @@ fn default_request_timeout_secs() -> u64 {
 
 fn default_connect_timeout_secs() -> u64 {
     10
+}
+
+fn default_model_catalog_ttl_secs() -> u64 {
+    300
 }
 
 fn default_max_web_search_rounds() -> usize {
@@ -1349,6 +1360,7 @@ impl Default for PersistedConfig {
             brave_max_results: default_brave_max_results(),
             request_timeout_secs: default_request_timeout_secs(),
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: default_model_catalog_ttl_secs(),
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
@@ -1554,6 +1566,7 @@ impl Config {
             brave_max_results: config.brave_max_results,
             request_timeout: Duration::from_secs(config.request_timeout_secs),
             connect_timeout_secs: config.connect_timeout_secs,
+            model_catalog_ttl_secs: config.model_catalog_ttl_secs,
             max_web_search_rounds: config.max_web_search_rounds,
             flatten_content: config.flatten_content,
             max_replay_entries: config.max_replay_entries,
@@ -2407,6 +2420,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.connect_timeout_secs = parsed;
     }
+    if let Ok(value) = env::var("LLMCONDUIT_MODEL_CATALOG_TTL_SECS")
+        && let Ok(parsed) = value.parse()
+    {
+        config.model_catalog_ttl_secs = parsed;
+    }
     if let Ok(value) = env::var("LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS")
         && let Ok(parsed) = value.parse()
     {
@@ -3199,6 +3217,21 @@ model_profiles:
     }
 
     #[test]
+    fn model_catalog_ttl_defaults_and_env_override() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let mut config = PersistedConfig::default();
+        assert_eq!(config.model_catalog_ttl_secs, 300);
+        unsafe {
+            std::env::set_var("LLMCONDUIT_MODEL_CATALOG_TTL_SECS", "30");
+        }
+        apply_env_overrides(&mut config);
+        assert_eq!(config.model_catalog_ttl_secs, 30);
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_MODEL_CATALOG_TTL_SECS");
+        };
+    }
+
+    #[test]
     fn persisted_config_roundtrips() {
         let path = std::env::temp_dir().join(format!(
             "llmconduit-config-{}.yaml",
@@ -3257,6 +3290,7 @@ model_profiles:
             brave_max_results: 7,
             request_timeout_secs: 45,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 10,
             flatten_content: false,
             max_replay_entries: 1000,
@@ -3328,6 +3362,7 @@ model_profiles:
             brave_max_results: 5,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
@@ -3507,6 +3542,7 @@ model_profiles:
             brave_max_results: 5,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
@@ -3582,6 +3618,7 @@ model_profiles:
             brave_max_results: 5,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
@@ -3687,6 +3724,7 @@ model_profiles:
             brave_max_results: 5,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
@@ -3792,6 +3830,7 @@ model_profiles:
             brave_max_results: 5,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
@@ -4188,6 +4227,7 @@ model_profiles:
             brave_max_results: 5,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
@@ -4249,6 +4289,7 @@ model_profiles:
             brave_max_results: 5,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
+            model_catalog_ttl_secs: 300,
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,

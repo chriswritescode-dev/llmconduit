@@ -64,8 +64,6 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-const UPSTREAM_MODEL_CATALOG_TTL_SECS: u64 = 300;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizeCapability {
     Unknown,
@@ -560,13 +558,15 @@ fn flow_status_artifact_str(status: crate::dashboard_flow::FlowStatus) -> &'stat
     }
 }
 
-/// Whether a Chat-Completions inbound request asked for reasoning, either via
-/// the top-level `reasoning_effort` field or an explicit thinking knob in
-/// `chat_template_kwargs` (`thinking` / `enable_thinking`). When true, forced
-/// family reasoning is NOT considered "unrequested" and Chat output is left
-/// untouched.
-fn chat_request_requested_reasoning(request: &ChatCompletionRequest) -> bool {
-    if request.reasoning_effort.is_some() {
+/// Whether a Chat-Completions inbound request explicitly disabled reasoning.
+/// Absence means "use the model/server default" and must not hide a backend's
+/// normal `reasoning_content` stream from Chat clients that render thinking.
+fn chat_request_disabled_reasoning(request: &ChatCompletionRequest) -> bool {
+    if request
+        .reasoning_effort
+        .as_deref()
+        .is_some_and(is_reasoning_disabled_value)
+    {
         return true;
     }
     request
@@ -574,10 +574,25 @@ fn chat_request_requested_reasoning(request: &ChatCompletionRequest) -> bool {
         .get("chat_template_kwargs")
         .and_then(Value::as_object)
         .is_some_and(|kwargs| {
-            kwargs.contains_key("thinking")
-                || kwargs.contains_key("enable_thinking")
-                || kwargs.contains_key("reasoning_effort")
+            ["thinking", "enable_thinking", "reasoning_effort"]
+                .into_iter()
+                .any(|key| kwargs.get(key).is_some_and(value_disables_reasoning))
         })
+}
+
+fn value_disables_reasoning(value: &Value) -> bool {
+    match value {
+        Value::Bool(enabled) => !enabled,
+        Value::String(value) => is_reasoning_disabled_value(value),
+        _ => false,
+    }
+}
+
+fn is_reasoning_disabled_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "false" | "off" | "no" | "none" | "disabled" | "disable" | "0"
+    )
 }
 
 fn build_upstream_extra_body(
@@ -1024,21 +1039,13 @@ impl Gateway {
     }
 
     /// Decide whether the Chat output converter must suppress
-    /// `reasoning_content` for this inbound request. We suppress whenever the
-    /// inbound Chat client did NOT request reasoning, for ALL models and
-    /// independent of the backend family (G2, Finding 1). Cross-family
-    /// routing/failover means the engine-resolved family is not a reliable proxy
-    /// for what the backend will actually emit, so the decision is computed
-    /// purely from the inbound request at the HTTP boundary: a Chat client that
-    /// never asked for reasoning must never receive server-side chain-of-thought
-    /// (AGENTS.md: do not leak server-side internals to Chat).
-    ///
-    /// The client is considered to have requested reasoning if it sent
-    /// `reasoning_effort` OR explicitly set a thinking knob (`thinking` /
-    /// `enable_thinking`) in its `chat_template_kwargs` — in those cases
-    /// `reasoning_content` is surfaced unchanged.
+    /// `reasoning_content` for this inbound request. Suppression is opt-out:
+    /// a request that omits thinking parameters receives the backend/model
+    /// default stream unchanged, including `reasoning_content` if the model
+    /// emits it. Only an explicit disable (`reasoning_effort: none`,
+    /// `thinking: false`, `enable_thinking: false`, etc.) hides reasoning.
     pub fn chat_reasoning_suppressed(&self, request: &ChatCompletionRequest) -> bool {
-        !chat_request_requested_reasoning(request)
+        chat_request_disabled_reasoning(request)
     }
 
     pub fn subscribe_monitor(
@@ -3088,7 +3095,7 @@ impl Gateway {
     /// so the map stays bounded even under random/hostile model names.
     fn should_warn_model_fallback(&self, requested_model: &str) -> bool {
         let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(UPSTREAM_MODEL_CATALOG_TTL_SECS);
+        let window = std::time::Duration::from_secs(self.config.model_catalog_ttl_secs);
         let mut warned = self
             .model_fallback_warned
             .lock()
@@ -3104,7 +3111,7 @@ impl Gateway {
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
         let mut cache = self.upstream_model_catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed().as_secs() < self.config.model_catalog_ttl_secs
         {
             return Ok(cached.catalog.clone());
         }

@@ -930,19 +930,10 @@ fn response_stop_reason(data: &Value) -> Option<String> {
 }
 
 /// Typed terminal reason the engine carries on the terminal resource (T7).
-/// `None` only when the field is ABSENT (a non-terminal resource, or an older
-/// event that the engine did not tag — the caller falls back to the event-type
-/// string). A PRESENT-but-unrecognized reason maps to `Other` (non-clean), NOT
-/// `None` — so a future reason the converter doesn't know still gates as
-/// non-clean rather than falling back to the event-type string (T7 R1 fix).
-/// Reads `data.response.terminal_reason`.
+/// Reads `data.response.terminal_reason` via the shared
+/// `TerminalReason::from_resource_value` (also used by the Chat converter's
+/// promotion gate — one authoritative read, T7 R1 semantics documented there).
 fn response_terminal_reason(data: &Value) -> Option<crate::models::responses::TerminalReason> {
-    use crate::models::responses::TerminalReason;
     data.get("response")
-        .and_then(|response| response.get("terminal_reason"))
-        .and_then(Value::as_str)
-        // Delegate to the canonical string→variant map (the sole authoritative
-        // mapping). PRESENT-but-unrecognized ⇒ `Other` (non-clean, never falls
-        // back to the event-type string); ABSENT ⇒ `None` (T7 R1 invariant).
-        .map(|reason| TerminalReason::from_finish_reason(Some(reason)))
+        .and_then(crate::models::responses::TerminalReason::from_resource_value)
 }

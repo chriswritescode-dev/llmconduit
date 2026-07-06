@@ -563,6 +563,19 @@ impl TerminalReason {
             _ => TerminalReason::Other,
         }
     }
+
+    /// Read the typed terminal reason off a serialized `response` resource
+    /// value (T7). `None` only when the field is ABSENT (a non-terminal
+    /// resource, or an older event the engine did not tag — callers fall back
+    /// to the event-type string). A PRESENT-but-unrecognized reason maps to
+    /// `Other` (non-clean), NOT `None`, so a future reason a converter doesn't
+    /// know still gates as non-clean (T7 R1 invariant).
+    pub fn from_resource_value(response: &Value) -> Option<Self> {
+        response
+            .get("terminal_reason")
+            .and_then(Value::as_str)
+            .map(|reason| TerminalReason::from_finish_reason(Some(reason)))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

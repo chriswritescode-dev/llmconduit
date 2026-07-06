@@ -503,6 +503,7 @@ pub fn test_config() -> Config {
         brave_max_results: 5,
         request_timeout: std::time::Duration::from_secs(30),
         connect_timeout_secs: 10,
+        model_catalog_ttl_secs: 300,
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,

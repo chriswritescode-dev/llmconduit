@@ -1428,8 +1428,7 @@ async fn post_chat_completions(
         .is_some_and(|options| options.include_usage);
     // Decide BEFORE converting (which consumes the inbound request) whether the
     // Chat output converter must suppress `reasoning_content`. Suppression is
-    // family-independent: a Chat client that did not request reasoning never
-    // receives server-side chain-of-thought from ANY model (G2, Finding 1).
+    // explicit opt-out only: absent thinking params keep the model default.
     let suppress_reasoning = gateway.chat_reasoning_suppressed(&request);
     let responses_request = chat_completions::convert_request(request)?;
     let stream = gateway
