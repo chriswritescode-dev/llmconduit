@@ -4374,26 +4374,28 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
     assert_eq!(requests.len(), 1);
     let messages = &requests[0].messages;
 
-    // M4: assistant with content does NOT merge with tool call — separate messages
-    let content_msg = messages
-        .iter()
-        .find(|m| m.role == "assistant" && m.content.is_some())
-        .expect("assistant message with content");
+    // The assistant turn's text, reasoning, and tool call all belong to ONE
+    // upstream chat message (`content` + `reasoning_content` + `tool_calls`) —
+    // the OpenAI Chat shape a real client emits. Splitting them into separate
+    // assistant messages rewrites the transcript into a shape that teaches some
+    // backends to end a turn with a text preamble instead of calling the tool.
+    let assistant_msgs: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
     assert_eq!(
-        content_msg.content,
+        assistant_msgs.len(),
+        1,
+        "text + reasoning + tool call must collapse into one assistant message"
+    );
+    let merged = assistant_msgs[0];
+    assert_eq!(
+        merged.content,
         Some(serde_json::Value::String(
             "I'll search the codebase.".to_string()
         ))
     );
-    assert!(content_msg.reasoning_content.is_some());
-    assert!(content_msg.tool_calls.is_none());
-
-    let tool_msg = messages
-        .iter()
-        .find(|m| m.role == "assistant" && m.tool_calls.is_some())
-        .expect("assistant message with tool_calls");
-    assert!(tool_msg.content.is_none());
-    assert_eq!(tool_msg.tool_calls.as_ref().unwrap().len(), 1);
+    assert!(merged.reasoning_content.is_some());
+    let calls = merged.tool_calls.as_ref().expect("merged tool call");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name.as_deref(), Some("exec_command"));
 }
 
 #[tokio::test]
