@@ -1,0 +1,27 @@
+services:
+  llmconduit:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: llmconduit:local
+    container_name: llmconduit
+    restart: unless-stopped
+    network_mode: host
+    # Enable the embedded debug UI + dashboard (served at /debug and /dashboard
+    # on the same :8000 listener).
+    command: ["start", "--with-debug-ui"]
+    environment:
+      # The image bakes LLMCONDUIT_BIND_ADDR=0.0.0.0:4000, which overrides the
+      # config file's bind_addr. Pin it back to the port the config binds.
+      LLMCONDUIT_BIND_ADDR: 0.0.0.0:8000
+      RUST_LOG: info
+      # Non-loopback bind: the dashboard refuses to register unless auth is
+      # explicitly configured. This enables FULLY UNAUTHENTICATED, plaintext
+      # dashboard access on every interface — anyone who can reach :8000 sees
+      # all request/response transcripts. Only acceptable on a trusted LAN.
+      LLMCONDUIT_ALLOW_INSECURE_DASHBOARD: "1"
+    volumes:
+      - ./config.yaml:/home/nonroot/.config/llmconduit/config.yaml:ro
+      - ./turncap:/home/nonroot/turncap
+    # No healthcheck: the distroless image ships no shell/curl to probe /health,
+    # and `restart: unless-stopped` already covers crash-restart + host-reboot.
