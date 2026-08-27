@@ -4,3 +4,7 @@
 
 # Local orchestration state.
 .ralph/
+
+# Local deployment secrets (API key digests, dashboard token).
+.env
+deploy/.env

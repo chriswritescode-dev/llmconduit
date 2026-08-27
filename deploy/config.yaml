@@ -1,8 +1,8 @@
 bind_addr: 0.0.0.0:8000
-upstream_failure_cooldown_secs: 30
+upstream_failure_cooldown_secs: 5
 request_timeout_secs: 300
 connect_timeout_secs: 10
-model_catalog_ttl_secs: 30
+model_catalog_ttl_secs: 10
 flatten_content: true
 max_replay_entries: 1000
 max_sse_frame_bytes: 8388608
@@ -14,28 +14,32 @@ unsupported_image_policy: placeholder
 # turn_capture_dir: /home/nonroot/turncap  # disabled — was accumulating ~16k files
 
 model_profiles:
-  mimo-v2.5:
+  GLM-5.3-Flash:
     native_vision: true
-  Qwen3.6-35B-A3B:
+  Qwen3.8-27B:
     native_vision: true
-  Qwen3.6-35B-A3B-no-think:
+  qwen-3.8-27b-no-think:
     native_vision: true
 
 upstreams:
   # First upstream's first catalog model is the default for blank/unknown models.
-  - name: mimo
+  - name: glm
     upstream_base_url: http://localhost:8001/v1
+    upstream_model: GLM-5.3-Flash
   - name: qwen
     upstream_base_url: http://192.168.1.243:8000/v1
-    upstream_chat_kwargs:
-      chat_template_kwargs:
-        enable_thinking: true
+    upstream_model: Qwen3.8-27B
     fallback_upstreams:
       - name: qwen-no-think
         upstream_base_url: http://192.168.1.243:8000/v1
-        exposed_model: Qwen3.6-35B-A3B-no-think
-        upstream_model: Qwen3.6-35B-A3B
+        exposed_model: qwen-3.8-27b-no-think
+        upstream_model: Qwen3.8-27B
         upstream_chat_kwargs:
+          temperature: 0.7
+          top_p: 0.80
           top_k: 20
+          min_p: 0.0
+          presence_penalty: 1.5
+          repetition_penalty: 1.0
           chat_template_kwargs:
             enable_thinking: false

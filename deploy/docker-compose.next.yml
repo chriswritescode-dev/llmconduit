@@ -1,0 +1,64 @@
+# Candidate stack for the inbound API-key + per-client concurrency build.
+#
+# Deliberately INDEPENDENT of docker-compose.yml: its own project name, image
+# tag, container name and port, so `docker compose -f docker-compose.next.yml
+# ...` can never recreate or stop the validated `llmconduit` container running
+# on :8000.
+#
+# Promote by pointing cloudflared at :8010 and retiring the old stack; roll back
+# by pointing it back at :8000.
+name: llmconduit-next
+
+services:
+  llmconduit-next:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: llmconduit:next
+    container_name: llmconduit-next
+    restart: unless-stopped
+    # Host networking is LOAD-BEARING for the peer-address allow-list below: it
+    # is what makes the observed peer the REAL client address. Under Docker port
+    # publishing every peer would instead be the bridge gateway, and
+    # LLMCONDUIT_TRUSTED_CIDRS would hand keyless access to anything that can
+    # reach the published port.
+    network_mode: host
+    command: ["start", "--with-debug-ui"]
+    env_file:
+      - .env
+    environment:
+      # Distinct from the running stack's :8000. Overrides config.yaml's
+      # bind_addr, which is why config.yaml can be shared read-only.
+      LLMCONDUIT_BIND_ADDR: 0.0.0.0:8010
+      RUST_LOG: info
+
+      # --- inbound API key -------------------------------------------------
+      # LLMCONDUIT_API_KEYS comes from .env (digests only, never a usable key).
+      # Applies to /v1/* only; /health and / stay open.
+
+      # --- keyless LAN ------------------------------------------------------
+      LLMCONDUIT_TRUSTED_CIDRS: 192.168.1.0/24
+      # THE load-bearing exclusion. 192.168.1.245 is the cloudflared host and is
+      # INSIDE the trusted /24 above. Evaluated first and wins, so tunnel traffic
+      # is keyed. Without this line every request from the public internet
+      # arrives from a "trusted LAN address" and the gateway is an open relay.
+      # If that box ever changes address, update this line FIRST.
+      LLMCONDUIT_KEYED_CIDRS: 192.168.1.245
+
+      # --- concurrency ------------------------------------------------------
+      # Per client identity: each named key gets its own budget, and all keyless
+      # LAN traffic shares one. Over-limit requests get 429 + Retry-After.
+      LLMCONDUIT_MAX_CONCURRENT_PER_CLIENT: "4"
+
+      # --- dashboard --------------------------------------------------------
+      # TOKEN + SESSION_KEY come from .env. With a token configured, ALLOW_INSECURE
+      # permits plaintext http on the LAN but does NOT re-enable the unauthenticated
+      # dev-open path (that only applies when no token is set) — unlike the :8000
+      # stack, which is currently open to anyone who can reach it.
+      LLMCONDUIT_ALLOW_INSECURE_DASHBOARD: "1"
+      # ALLOW_INSECURE relaxes only the https REQUIREMENT, not the need for an
+      # exact origin: without this the protected routes refuse to register at all.
+      LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN: http://192.168.1.244:8010
+    volumes:
+      # Shared read-only with the running stack; the bind port is overridden above.
+      - ./config.yaml:/home/nonroot/.config/llmconduit/config.yaml:ro
