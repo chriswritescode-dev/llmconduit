@@ -89,6 +89,14 @@ pub struct FinalizedAssistantTurn {
     /// turn; non-empty taints the WHOLE batch (no `tool_calls` are executed or
     /// handed off) and triggers the engine's bounded repair round.
     pub rejected_tool_calls: Vec<RejectedToolCall>,
+    /// Names of tool calls whose argument JSON was cut mid-generation by the
+    /// upstream output-token cap (`finish_reason: length`). The calls are
+    /// dropped — never executed, never handed off, and NO repair round (the
+    /// model has no budget left to repair with) — so the turn still finalizes
+    /// and the engine's terminal mapping surfaces `response.incomplete` /
+    /// `max_output_tokens`, the truncation signal clients recover from by
+    /// retrying, instead of a hard error that stops that recovery.
+    pub truncated_tool_calls: Vec<String>,
     pub internal_assistant_message: Option<ChatMessage>,
     pub content_part_emitted: bool,
     pub reasoning_part_emitted: bool,
@@ -301,6 +309,10 @@ impl StreamState {
         let mut resolved_tool_calls = Vec::new();
         let mut rejected_tool_calls = Vec::new();
         let mut internal_tool_calls = Vec::new();
+        let mut truncated_tool_calls = Vec::new();
+        // `length` means the upstream stopped emitting at its output-token cap,
+        // so a tool call at the stream tail can legitimately end mid-arguments.
+        let truncated_by_length = self.finish_reason.as_deref() == Some("length");
         for accumulator in self.tool_calls.into_values() {
             // A missing function name is still a HARD error: the chunk stream is
             // malformed, not a recoverable unoffered-tool generation.
@@ -342,11 +354,23 @@ impl StreamState {
                 Value::Object(Default::default())
             } else {
                 let cleaned = extract_json_arguments(&accumulator.arguments_text);
-                serde_json::from_str(cleaned).map_err(|err| {
-                    AppError::upstream(format!(
-                        "failed to parse upstream tool arguments for {name}: {err}"
-                    ))
-                })?
+                match serde_json::from_str(cleaned) {
+                    Ok(arguments) => arguments,
+                    // A KNOWN tool whose args were cut by the token cap is a
+                    // routine truncation, not upstream corruption: drop the
+                    // unexecutable call (recorded for the engine's WARN) and
+                    // keep finalizing so the turn ends as `response.incomplete`
+                    // instead of aborting with an opaque hard error.
+                    Err(_) if truncated_by_length => {
+                        truncated_tool_calls.push(name);
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(AppError::upstream(format!(
+                            "failed to parse upstream tool arguments for {name}: {err}"
+                        )));
+                    }
+                }
             };
             let public_item = match &tool_kind {
                 ToolKind::Function {
@@ -482,6 +506,7 @@ impl StreamState {
             reasoning_item,
             tool_calls: resolved_tool_calls,
             rejected_tool_calls,
+            truncated_tool_calls,
             internal_assistant_message,
             content_part_emitted: self.content_part_emitted,
             reasoning_part_emitted: self.reasoning_part_emitted,
@@ -1478,5 +1503,113 @@ mod tests {
             } => assert_eq!(query.as_deref(), Some("boppard weather")),
             other => panic!("expected web_search_call, got {other:?}"),
         }
+    }
+
+    fn bare_finish_chunk(id: &str, reason: &str) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: id.to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    function_call: None,
+                    refusal: None,
+                    extra: Default::default(),
+                },
+                finish_reason: Some(reason.to_string()),
+                stop_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    fn bash_registry() -> ToolRegistry {
+        simple_registry(vec![(
+            "bash",
+            ToolKind::Function {
+                public_name: "bash".to_string(),
+                namespace: None,
+            },
+        )])
+    }
+
+    #[test]
+    fn finalize_drops_length_truncated_tool_arguments() {
+        // The upstream hit its output-token cap mid-tool-call: the args JSON
+        // ends inside a string literal and the terminal chunk carries
+        // `finish_reason: length`. This must NOT hard-error (which would stop
+        // the client's own truncation recovery); the call is dropped and the
+        // turn finalizes so the engine can surface `response.incomplete`.
+        let mut state = StreamState::default();
+        state.apply_chunk(&tool_call_chunk(
+            "c1",
+            Some("call_bash"),
+            0,
+            Some("bash"),
+            Some("{\"command\":\"grep -n 'list-sty"),
+        ));
+        state.apply_chunk(&bare_finish_chunk("c1", "length"));
+        let finalized = state
+            .finalize(&bash_registry())
+            .expect("a length-truncated tool call must not hard-error the turn");
+        assert!(
+            finalized.tool_calls.is_empty(),
+            "a truncated call is never executed or handed off"
+        );
+        assert!(
+            finalized.rejected_tool_calls.is_empty(),
+            "truncation is not an E1 rejection: no repair round (no budget left to repair with)"
+        );
+        assert_eq!(finalized.truncated_tool_calls, vec!["bash".to_string()]);
+        assert_eq!(
+            finalized.finish_reason.as_deref(),
+            Some("length"),
+            "the length signal must survive so the engine maps the turn to incomplete"
+        );
+    }
+
+    #[test]
+    fn finalize_still_hard_errors_on_malformed_arguments_without_length() {
+        // Identical truncated args but a clean `tool_calls` finish: the stream
+        // was NOT cut by the token cap, so this is genuine upstream corruption
+        // and must keep the hard error.
+        let mut state = StreamState::default();
+        state.apply_chunk(&tool_call_chunk(
+            "c1",
+            Some("call_bash"),
+            0,
+            Some("bash"),
+            Some("{\"command\":\"grep -n 'list-sty"),
+        ));
+        state.apply_chunk(&bare_finish_chunk("c1", "tool_calls"));
+        let err = state
+            .finalize(&bash_registry())
+            .expect_err("malformed args on a clean stop are corruption, not truncation");
+        assert!(
+            err.client_message
+                .contains("failed to parse upstream tool arguments for bash"),
+            "unexpected error: {}",
+            err.client_message
+        );
+    }
+
+    #[test]
+    fn finalize_keeps_parseable_tool_call_on_length_finish() {
+        // `finish_reason: length` with COMPLETE argument JSON (the cap landed
+        // after the call finished): the call is still resolved normally.
+        let mut state = StreamState::default();
+        state.apply_chunk(&tool_call_chunk(
+            "c1",
+            Some("call_bash"),
+            0,
+            Some("bash"),
+            Some("{\"command\":\"ls\"}"),
+        ));
+        state.apply_chunk(&bare_finish_chunk("c1", "length"));
+        let finalized = state.finalize(&bash_registry()).expect("finalize");
+        assert_eq!(finalized.tool_calls.len(), 1);
+        assert!(finalized.truncated_tool_calls.is_empty());
     }
 }

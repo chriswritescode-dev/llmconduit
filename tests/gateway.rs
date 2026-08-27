@@ -483,6 +483,66 @@ async fn streams_function_call_turn() {
     assert_eq!(requests[0].tools.as_ref().map(Vec::len), Some(1));
 }
 
+/// A turn the upstream cut at its output-token cap MID-TOOL-CALL: the tool-call
+/// argument JSON is truncated and unparseable. The gateway must NOT abort with an
+/// opaque `gateway_error` (the old behavior, which stopped the client's own
+/// truncation recovery); it drops the unexecutable call and finishes the turn as
+/// `response.incomplete` / `max_output_tokens`, the signal clients already handle
+/// by retrying.
+#[tokio::test]
+async fn length_truncated_tool_call_finishes_incomplete_instead_of_hard_error() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(partial_tool_call_chunk(
+                "chat-1",
+                "call_bash",
+                "bash",
+                "{\"command\":\"grep -n 'list-style' src/styles.css && echo",
+            )),
+            Ok(length_finish_chunk("chat-1")),
+        ])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut request = base_request(vec![user_message("hello")]);
+    request.tools = vec![ToolSpec::Function {
+        name: "bash".to_string(),
+        description: "Run a shell command".to_string(),
+        strict: false,
+        parameters: json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        }),
+    }];
+
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    let names = event_names(&events);
+    assert!(
+        !names.contains(&"error"),
+        "a token-cap truncation is not a gateway error: {names:?}"
+    );
+    let terminal = events.last().expect("terminal event");
+    assert_eq!(
+        terminal["_event"], "response.incomplete",
+        "the turn must terminate as incomplete, got {names:?}"
+    );
+    assert_eq!(terminal["response"]["status"], "incomplete");
+    assert_eq!(
+        terminal["response"]["incomplete_details"]["reason"], "max_output_tokens",
+        "clients key their retry on this reason: {terminal}"
+    );
+    assert!(
+        !terminal["response"]["output"]
+            .as_array()
+            .expect("output array")
+            .iter()
+            .any(|item| item["type"] == "function_call"),
+        "the truncated call must never be handed off: {terminal}"
+    );
+}
+
 #[tokio::test]
 async fn raw_output_observes_gateway_sse_deltas() {
     let upstream = MockUpstream::default();
@@ -7445,6 +7505,20 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
         }],
         usage: None,
     }
+}
+
+/// A tool-call argument fragment WITHOUT a `finish_reason` — how vLLM streams a
+/// call that is later cut by the output-token cap (the terminal
+/// [`length_finish_chunk`] follows instead of a `tool_calls` finish).
+fn partial_tool_call_chunk(
+    id: &str,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+) -> ChatCompletionChunk {
+    let mut chunk = tool_call_chunk(id, call_id, name, arguments);
+    chunk.choices[0].finish_reason = None;
+    chunk
 }
 
 fn legacy_function_call_chunk(id: &str, name: &str, arguments: &str) -> ChatCompletionChunk {

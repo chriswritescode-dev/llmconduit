@@ -2665,6 +2665,16 @@ impl Gateway {
                 accumulated_usage.add(usage);
             }
             let finalized = state.finalize(&tool_registry)?;
+            // Truncation observability (same journalctl lesson as E1): a
+            // token-cap cut mid-tool-call is dropped in `finalize()` and the
+            // turn ends `response.incomplete`; make that visible server-side.
+            if !finalized.truncated_tool_calls.is_empty() {
+                tracing::warn!(
+                    response_id = %response_id,
+                    tools = ?finalized.truncated_tool_calls,
+                    "output-token cap cut the upstream stream mid-tool-call; dropping the truncated call(s) and finishing the turn as incomplete"
+                );
+            }
             last_finish_reason = finalized.finish_reason.clone();
             last_stop_sequence = finalized.stop_sequence.clone();
             current_messages = upstream_request.messages;
